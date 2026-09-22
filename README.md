@@ -11,18 +11,32 @@ and are deliberately out of scope (see [Roadmap](#roadmap)).
 ## Install
 
 ```bash
-# Add this repo as a skill tap, then install
+# Add this repo as a skill tap, then install from the hub
 hermes skills tap add hortocam/kalshi-skill
-hermes skills install kalshi
+hermes skills install hortocam/kalshi-skill/skills/kalshi --category finance
 ```
 
-Or install it straight from a checkout:
+Installing into a specific profile:
 
 ```bash
-cp -r skills/kalshi ~/.hermes/skills/kalshi
+hermes -p <profile> skills tap add hortocam/kalshi-skill
+hermes -p <profile> skills install hortocam/kalshi-skill/skills/kalshi --category finance
 ```
 
+Or clone and copy into place:
+
+```bash
+cp -r skills/kalshi ~/.hermes/skills/finance/kalshi
+```
+
+Installs are scanned by the Skills Hub guard (community trust) before landing.
 Skills load on the next session — a running session won't see it until it restarts.
+
+**Heads up:** the hub's GitHub lookups run unauthenticated unless `GITHUB_TOKEN`
+is set, and unauthenticated GitHub allows only 60 requests/hour — easily
+exhausted by a hub index build, after which tap searches silently return nothing.
+Set `GITHUB_TOKEN` (a `repo`-scoped PAT is plenty) in `~/.hermes/.env` if you
+plan to use taps.
 
 ## What's in here
 
