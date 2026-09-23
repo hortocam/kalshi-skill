@@ -54,3 +54,13 @@ names a command that was actually run.
 - [x] T028 Open PR #1 against `main` under the `wt/research-store` branch per Constitution III
 - [x] T029 Merge PR #1 to `main` as the coordinator per Constitution V
 - [ ] T030 Run `speckit-converge` against this feature directory to close the process gap recorded in the plan's Complexity Notes per Constitution IV
+
+## Phase 7: Positions & realized P&L (schema v2, addendum 2026-09-23)
+
+Card `t_4302ce7e`. Implements FR-013…FR-016. All rows written TDD (red first).
+
+- [x] T031 Schema v2: `positions` table + nullable `predictions.position_id`, idempotent v1→v2 migration preserving every row per FR-013 (evidence: `test_v1_store_migrates_to_v2_preserving_rows` green; live-store copy migrates with identical counts, `schema_version` rows `[1,2]`)
+- [x] T032 `record-position --file` with computed taker fee (round UP of `M * 0.07 * C * P * (1-P)`), run begin/touch, and `(market_ticker, side, opened_at)` idempotency per FR-014 (evidence: `test_record_position_computes_the_fee`, `test_record_position_is_idempotent` — 24.9 @ 0.19 → fee 0.27)
+- [x] T033 Settlement in `resolve-predictions`: explicit `position_id` links always settle; ticker side-match only when `direction` implies a side (absent direction → explicit links only, FR-015); idempotent re-resolve (evidence: `test_absent_direction_settles_explicit_links_only`, `test_expected_sides_never_invent_a_side`, `test_reresolve_is_idempotent`)
+- [x] T034 `pnl [--open]`: realized rows + totals, and a stored-quotes-only mark for open positions, no network per FR-016 (evidence: `test_pnl_totals`, `test_pnl_open_marks_from_stored_quotes`, `test_pnl_on_an_empty_store_degrades_gracefully`)
+- [x] T035 Positions test suite green: 50 stdlib unittest tests, `python3 skills/kalshi/scripts/tests/test_research_store.py` → `Ran 50 tests in 3.250s — OK`

@@ -5,7 +5,8 @@ re-deriving it. This is the contract for `scripts/research_store.py` and for the
 SQLite store it owns.
 
 Design authority: card `t_367040dd` (`research-continuity-design.md`), approved
-by independent review. Implementation: card `t_eb12306c`.
+by independent review. Implementation: card `t_eb12306c`. Addendum — positions
+& realized P&L (schema v2): card `t_4302ce7e`.
 
 ## The split
 
@@ -36,10 +37,10 @@ takes the print's own date from the event ticker's day stamp (`KXAAAGASD-26SEP22
 assumption, and it is load-bearing: converting a 03:59Z close into
 `America/New_York` would file that ladder one day early.
 
-## Schema — ten tables
+## Schema — eleven tables
 
 `schema_version`, `series`, `observations`, `settlements`, `markets`, `quotes`,
-`models`, `predictions`, `cache_meta`, `runs`.
+`models`, `predictions`, `cache_meta`, `runs`, `positions` (v2).
 
 | Table | Holds | Natural key (idempotent writes) |
 |---|---|---|
@@ -49,9 +50,10 @@ assumption, and it is load-bearing: converting a 03:59Z close into
 | `markets` | settled and open strikes, rules hash | `market_ticker` |
 | `quotes` | market-implied price at a fixed offset before close | `(market_ticker, hours_before_close)` |
 | `models` | **DERIVED** parameters, persisted so drift is queryable | `(series_id, model_name, fit_date)` |
-| `predictions` | the bot's own expectation, and its later resolution | `id` |
+| `predictions` | the bot's own expectation, and its later resolution; v2 adds nullable `position_id` | `id` |
 | `cache_meta` | the freshness contract, plus the reserved `store_rev` | `key` |
 | `runs` | the run ledger — what makes "since last run" a join | `id` |
+| `positions` | an **executed trade**: contracts, fill price, fee, and its realized P&L | `(market_ticker, side, opened_at)` |
 
 Every write is `INSERT … ON CONFLICT(natural key) DO UPDATE`, so re-running a
 fetch is free. `ingest-settled` additionally skips events already stored as
@@ -176,6 +178,52 @@ never mixed:
 against a price sd would be meaningless, so the digest only reports
 "inside ±1 sd" over the price-unit predictions and reports the counts of each.
 
+## Positions and realized P&L (schema v2)
+
+The store records the *expectation* (`predictions`) and the *trade*
+(`positions`) separately: the lifecycle is 1:1 today but need not stay so, so
+P&L never lives on the prediction row — `predictions.position_id` is a nullable
+pointer, and a position may exist without any prediction.
+
+```
+{"market_ticker": "KXDIESELD-26SEP24-T6.515", "side": "yes",
+ "contracts": 24.90, "fill_price": 0.19, "prediction_id": 5,
+ "opened_at": "2026-09-23T18:06:00Z"}
+```
+
+The **fee is computed, not accepted**: when `fee` is omitted,
+`record-position` stores the Kalshi taker fee — round UP to the next cent of
+`M * 0.07 * C * P * (1-P)` (fee schedule fetched 2026-09-23; no settlement
+fee; contracts settle at $1.00/$0.00). 24.90 contracts at 0.19 → 0.27.
+
+**Entry-price convention (side='no'):** `fill_price` is ALWAYS the price paid
+for the side bought — the YES price when `side='yes'`, the **NO price** (about
+`1 - yes_price`) when `side='no'`. The orderbook quotes YES prices; a NO fill
+at 0.81 is the same trade as a YES fill at 0.19, and recording which side was
+bought is what makes settlement unambiguous.
+
+`resolve-predictions` settles positions when a prediction resolves to a market
+outcome (`yes`/`no` — never for the `up`/`down`/`flat` print directions, which
+are not settlements):
+
+- win: `realized_pnl = contracts * (1 - fill_price) - fee`
+- loss: `realized_pnl = -(contracts * fill_price) - fee`
+
+A position is linked to its prediction by explicit `position_id` (back-filled
+onto the prediction row) or, failing that, by `market_ticker` plus the side
+the prediction's `direction` implies (`up` → yes, `down` → no; absent
+direction → no side match, explicit links only). Settlement is idempotent:
+`settled_at`/`realized_pnl`, once written, are never rewritten, and
+re-resolving changes nothing. Positions with no resolvable prediction stay
+open.
+
+`pnl` reports settled rows with totals. `pnl --open` adds a **mark-to-market
+view** of open positions from the most recent *stored* quote per market (bid,
+then ask, then last; a NO position is marked at `1 - quote`) — clearly labelled
+an unrealized mark, never a realized result, and computed with **no network
+access** (FR-010): the `--open` view from stored quotes is the cap; live
+mark-to-market in resolution is deliberately out of scope.
+
 ## Commands
 
 ```
@@ -192,6 +240,8 @@ research_store.py digest [--since-last-run] [--family F] [--max-lines 60]
 research_store.py stale
 research_store.py record-prediction --file pred.json
 research_store.py resolve-predictions [--as-of DATE]
+research_store.py record-position --file pos.json
+research_store.py pnl [--open]
 research_store.py series --family F [--tail 20]
 ```
 

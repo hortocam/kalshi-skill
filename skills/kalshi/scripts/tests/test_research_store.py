@@ -280,7 +280,7 @@ class TestDigest(StoreTestCase):
         names = p._subparsers._group_actions[0].choices
         expected = {"init", "ingest-settled", "ingest-closes", "ingest-quotes",
                     "fit", "digest", "stale", "record-prediction",
-                    "resolve-predictions", "series"}
+                    "resolve-predictions", "series", "record-position", "pnl"}
         self.assertEqual(expected, set(names))
 
     def test_json_flag_on_every_subcommand(self):
@@ -535,6 +535,461 @@ class TestPredictions(StoreTestCase):
         self.assertAlmostEqual(got["error"], 6.5300 - 6.5125, places=6)
         # 09-21 (6.5125) is above 09-20 (6.5075), so the print's direction is up.
         self.assertEqual(got["outcome"], "up")
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Positions & realized P&L — schema v2 (card t_4302ce7e)
+# --------------------------------------------------------------------------
+
+DIESEL_TICKER = "KXDIESELD-26SEP24-T6.515"
+
+
+def _write_json(path, obj):
+    with open(path, "w") as fh:
+        json.dump(obj, fh)
+    return path
+
+
+class TestPositionFees(unittest.TestCase):
+    """The Kalshi taker fee: round UP to the next cent of
+    M * 0.07 * C * P * (1-P)  (fee schedule fetched 2026-09-23)."""
+
+    def test_taker_fee_rounds_up_to_the_next_cent(self):
+        # 0.07 * 24.9 * 0.19 * 0.81 = 0.2682477 -> 0.27 (the real trade's fee)
+        self.assertAlmostEqual(rs.taker_fee(24.9, 0.19), 0.27, places=6)
+
+    def test_taker_fee_exact_cents_do_not_round_up(self):
+        # 0.07 * 20 * 0.5 * 0.5 = 0.35 exactly: no spurious extra cent.
+        self.assertAlmostEqual(rs.taker_fee(20, 0.5), 0.35, places=6)
+
+    def test_taker_fee_respects_the_multiplier(self):
+        # 2 * 0.2682477 = 0.5364954 -> 0.54
+        self.assertAlmostEqual(rs.taker_fee(24.9, 0.19, multiplier=2), 0.54,
+                               places=6)
+
+
+class TestPositionSchema(StoreTestCase):
+    def test_v1_store_migrates_to_v2_preserving_rows(self):
+        """A v1 store (no positions table, no predictions.position_id) must
+        migrate in place with every prior row intact."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        # one v1 prediction row, then regress to the exact v1 shape
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": "KXTEST-26SEP22-T6.525",
+                             "p_yes": 0.4, "target_date": "2026-09-22"})
+        rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        conn.commit()
+        pred = conn.execute("SELECT COUNT(*) c FROM predictions").fetchone()["c"]
+        obs = conn.execute("SELECT COUNT(*) c FROM observations").fetchone()["c"]
+        self.assertGreater(pred, 0)
+        # Regress the store to its exact v1 shape (v1 objects + a version=1
+        # row, as a real pre-migration store has), then re-run init.
+        conn.executescript("DROP TABLE positions;")
+        conn.execute("ALTER TABLE predictions DROP COLUMN position_id")
+        conn.execute("UPDATE schema_version SET version = 1, applied_at ="
+                     " '2026-09-23T00:00:00.000000Z'")
+        conn.commit()
+        rs.init_db(conn)
+        after = rs.table_counts(conn)
+        self.assertEqual(after["observations"], obs)
+        self.assertEqual(after["predictions"], pred)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(predictions)")}
+        self.assertIn("position_id", cols)
+        vers = [r["version"] for r in conn.execute(
+            "SELECT version FROM schema_version ORDER BY version")]
+        self.assertEqual(vers, [1, 2], "the v1 version row must survive")
+        row = conn.execute(
+            "SELECT market_ticker, p_yes FROM predictions LIMIT 1").fetchone()
+        self.assertIsNotNone(row["market_ticker"])
+        conn.close()
+
+    def test_positions_table_enforces_checks(self):
+        conn = self.init()
+        base = ("INSERT INTO positions(market_ticker, side, contracts,"
+                " fill_price, fee, opened_at, created_at)"
+                " VALUES ('KXX-1', ?, 10, 0.2, 0.1, '2026-09-23T00:00:00Z',"
+                " '2026-09-23T00:00:00Z')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(base, ("maybe",))
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(base.replace("10, 0.2", "0, 0.2"),
+                         ("yes",))                            # contracts <= 0
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(base.replace("10, 0.2, 0.1", "10, 1.0, 0.1"),
+                         ("yes",))                            # fill_price >= 1
+        conn.close()
+
+
+class TestRecordPosition(StoreTestCase):
+    def _record(self, conn, obj, **kw):
+        args = type("A", (), dict(file=_write_json(
+            os.path.join(self.tmp, "pos.json"), obj), json=True, **kw))()
+        return rs.record_position(conn, args)
+
+    def test_record_position_computes_the_fee(self):
+        """The fee MUST be computed from the formula when omitted, never
+        accepted on faith."""
+        conn = self.init()
+        out = self._record(conn, {"market_ticker": DIESEL_TICKER,
+                                  "side": "yes", "contracts": 24.9,
+                                  "fill_price": 0.19})
+        self.assertEqual(out["count"], 1)
+        row = conn.execute("SELECT * FROM positions").fetchone()
+        self.assertEqual(row["market_ticker"], DIESEL_TICKER)
+        self.assertEqual(row["side"], "yes")
+        self.assertAlmostEqual(row["fee"], 0.27, places=6)
+        self.assertIsNotNone(row["opened_at"])
+        self.assertIsNotNone(row["created_at"])
+        self.assertIsNone(row["settled_at"])
+        self.assertIsNone(row["realized_pnl"])
+        conn.close()
+
+    def test_record_position_honors_explicit_fee_and_opened_at(self):
+        conn = self.init()
+        self._record(conn, {"market_ticker": DIESEL_TICKER, "side": "no",
+                            "contracts": 5, "fill_price": 0.81, "fee": 0.10,
+                            "opened_at": "2026-09-23T18:06:00Z"})
+        row = conn.execute("SELECT * FROM positions").fetchone()
+        self.assertAlmostEqual(row["fee"], 0.10, places=6)
+        self.assertEqual(row["opened_at"], "2026-09-23T18:06:00Z")
+        conn.close()
+
+    def test_record_position_is_idempotent(self):
+        conn = self.init()
+        payload = {"market_ticker": DIESEL_TICKER, "side": "yes",
+                   "contracts": 24.9, "fill_price": 0.19,
+                   "opened_at": "2026-09-23T18:06:00Z"}
+        first = self._record(conn, payload)
+        self.assertEqual(first["count"], 1)
+        second = self._record(conn, payload)
+        self.assertEqual(second["count"], 0)
+        self.assertEqual(second["duplicates"], 1)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) c FROM positions").fetchone()["c"], 1)
+        conn.close()
+
+    def test_record_position_links_and_backfills_the_prediction(self):
+        conn = self.init()
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": DIESEL_TICKER, "p_yes": 0.12,
+                             "target_date": "2026-09-24"})
+        pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        pid = pred["written"][0]["id"]
+        self._record(conn, {"market_ticker": DIESEL_TICKER, "side": "yes",
+                            "contracts": 24.9, "fill_price": 0.19,
+                            "prediction_id": pid})
+        row = conn.execute("SELECT prediction_id FROM positions").fetchone()
+        self.assertEqual(row["prediction_id"], pid)
+        back = conn.execute(
+            "SELECT position_id FROM predictions WHERE id = ?", (pid,)).fetchone()
+        self.assertIsNotNone(back["position_id"])
+        conn.close()
+
+    def test_record_position_rejects_an_unknown_prediction(self):
+        conn = self.init()
+        with self.assertRaises(SystemExit):
+            self._record(conn, {"market_ticker": DIESEL_TICKER, "side": "yes",
+                                "contracts": 1, "fill_price": 0.5,
+                                "prediction_id": 999})
+        conn.close()
+
+
+class TestPositionResolution(StoreTestCase):
+    """resolve-predictions settles linked/matching positions.  fill_price is
+    ALWAYS the price paid for the side bought (NO price for side='no')."""
+
+    def _setup(self, outcome_ticker):
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": outcome_ticker, "p_yes": 0.2,
+                             "target_date": "2026-09-22"})
+        pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        return conn, pred["written"][0]["id"]
+
+    def _resolve_and_settle(self, conn, pid, side, fill, contracts=24.9):
+        conn.execute("SELECT 1")  # keep linters honest about the conn use
+        self._pos_file = _write_json(os.path.join(self.tmp, "pos.json"),
+                                     {"market_ticker": "KXTEST-26SEP22-T6.530",
+                                      "side": side, "contracts": contracts,
+                                      "fill_price": fill, "prediction_id": pid})
+        args = type("A", (), {"file": self._pos_file, "json": True})()
+        rs.record_position(conn, args)
+        res = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        self.assertEqual(res["resolved_count"], 1)
+        pos = conn.execute("SELECT * FROM positions").fetchone()
+        pred = conn.execute(
+            "SELECT resolved_at, outcome FROM predictions WHERE id = ?",
+            (pid,)).fetchone()
+        return pos, res, pred
+
+    def test_yes_win_settles_positive(self):
+        # T6.525 <= print 6.5276 -> settles YES
+        conn, pid = self._setup("KXTEST-26SEP22-T6.525")
+        pos, res, pred = self._resolve_and_settle(conn, pid, "yes", 0.19)
+        self.assertEqual(pred["outcome"], "yes")
+        self.assertEqual(pos["side"], "yes")
+        self.assertEqual(pos["settled_at"], pred["resolved_at"])
+        self.assertAlmostEqual(pos["realized_pnl"], 24.9 * 0.81 - 0.27,
+                               places=6)
+        self.assertAlmostEqual(res["positions_settled"][0]["realized_pnl"],
+                               19.90, places=2)
+        conn.close()
+
+    def test_yes_loss_settles_negative(self):
+        # T6.530 > print 6.5276 -> settles NO
+        conn, pid = self._setup("KXTEST-26SEP22-T6.530")
+        pos, res, pred = self._resolve_and_settle(conn, pid, "yes", 0.19)
+        self.assertEqual(pred["outcome"], "no")
+        self.assertAlmostEqual(pos["realized_pnl"], -(24.9 * 0.19) - 0.27,
+                               places=6)
+        self.assertAlmostEqual(res["positions_settled"][0]["realized_pnl"],
+                               -5.00, places=2)
+        conn.close()
+
+    def test_no_win_settles_positive_at_the_no_price(self):
+        conn, pid = self._setup("KXTEST-26SEP22-T6.530")
+        pos, res, pred = self._resolve_and_settle(conn, pid, "no", 0.81)
+        self.assertEqual(pred["outcome"], "no")
+        fee = rs.taker_fee(24.9, 0.81)
+        self.assertAlmostEqual(pos["realized_pnl"], 24.9 * 0.19 - fee,
+                               places=6)
+        conn.close()
+
+    def test_no_loss_settles_negative_at_the_no_price(self):
+        conn, pid = self._setup("KXTEST-26SEP22-T6.525")
+        pos, res, pred = self._resolve_and_settle(conn, pid, "no", 0.81)
+        self.assertEqual(pred["outcome"], "yes")
+        fee = rs.taker_fee(24.9, 0.81)
+        self.assertAlmostEqual(pos["realized_pnl"], -(24.9 * 0.81) - fee,
+                               places=6)
+        conn.close()
+
+    def test_reresolve_is_idempotent(self):
+        conn, pid = self._setup("KXTEST-26SEP22-T6.525")
+        pos1, res1, _ = self._resolve_and_settle(conn, pid, "yes", 0.19)
+        res2 = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        self.assertEqual(res2["resolved_count"], 0)
+        self.assertEqual(res2["positions_settled"], [])
+        pos2 = conn.execute("SELECT * FROM positions").fetchone()
+        self.assertEqual(pos2["settled_at"], pos1["settled_at"])
+        self.assertEqual(pos2["realized_pnl"], pos1["realized_pnl"])
+        conn.close()
+
+    def test_side_match_settles_an_unlinked_position(self):
+        """A position matching the prediction's market_ticker+side settles
+        even with no explicit link (direction 'up' -> side 'yes')."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": "KXTEST-26SEP22-T6.530",
+                             "p_yes": 0.2, "target_date": "2026-09-22",
+                             "direction": "up"})
+        pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        pid = pred["written"][0]["id"]
+        posfile = _write_json(os.path.join(self.tmp, "pos.json"),
+                              {"market_ticker": "KXTEST-26SEP22-T6.530",
+                               "side": "yes", "contracts": 10,
+                               "fill_price": 0.2})
+        rs.record_position(conn, type("A", (), {"file": posfile, "json": True})())
+        res = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        self.assertEqual(len(res["positions_settled"]), 1)
+        row = conn.execute("SELECT realized_pnl, settled_at FROM positions"
+                           ).fetchone()
+        self.assertAlmostEqual(row["realized_pnl"], -(10 * 0.2) - 0.12,
+                               places=6)
+        self.assertIsNotNone(row["settled_at"])
+        # The prediction row itself is not force-linked by a side match.
+        back = conn.execute("SELECT position_id FROM predictions WHERE id = ?",
+                            (pid,)).fetchone()
+        self.assertIsNone(back["position_id"])
+        conn.close()
+
+    def test_absent_direction_settles_explicit_links_only(self):
+        """An absent `direction` implies no side (FR-015): the market_ticker
+        match alone must not settle an unlinked position, while an explicitly
+        linked position settles regardless of side."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": "KXTEST-26SEP22-T6.530",
+                             "p_yes": 0.2, "target_date": "2026-09-22"})
+        pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        pid = pred["written"][0]["id"]
+        # same ticker, no link: must stay open
+        unlinked = _write_json(os.path.join(self.tmp, "pos_un.json"),
+                               {"market_ticker": "KXTEST-26SEP22-T6.530",
+                                "side": "yes", "contracts": 10,
+                                "fill_price": 0.2})
+        rs.record_position(conn, type("A", (), {"file": unlinked,
+                                                "json": True})())
+        # linked by prediction_id: settles regardless of side
+        linked = _write_json(os.path.join(self.tmp, "pos_l.json"),
+                             {"market_ticker": "KXTEST-26SEP22-T6.530",
+                              "side": "no", "contracts": 5,
+                              "fill_price": 0.81, "prediction_id": pid})
+        rs.record_position(conn, type("A", (), {"file": linked,
+                                                "json": True})())
+        res = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        self.assertEqual(res["resolved_count"], 1)
+        self.assertEqual(len(res["positions_settled"]), 1)
+        rows = conn.execute("SELECT prediction_id, settled_at, realized_pnl"
+                            " FROM positions ORDER BY id").fetchall()
+        self.assertIsNone(rows[0]["prediction_id"])
+        self.assertIsNone(rows[0]["settled_at"])
+        self.assertIsNone(rows[0]["realized_pnl"])
+        self.assertEqual(rows[1]["prediction_id"], pid)
+        self.assertIsNotNone(rows[1]["settled_at"])
+        # T6.530 settles NO, so a NO position wins at the NO price
+        self.assertAlmostEqual(rows[1]["realized_pnl"],
+                               5 * (1 - 0.81) - rs.taker_fee(5, 0.81),
+                               places=6)
+        conn.close()
+
+    def test_expected_sides_never_invent_a_side(self):
+        self.assertEqual(rs._expected_sides({"direction": None}), ())
+        self.assertEqual(rs._expected_sides({"direction": "up"}), ("yes",))
+        self.assertEqual(rs._expected_sides({"direction": "down"}), ("no",))
+
+    def test_price_unit_outcomes_never_settle_positions(self):
+        """'up'/'down' outcomes are print directions, not settlements."""
+        conn, pid = self._setup("KXTEST-26SEP22-T6.530")
+        # give the prediction a series_id + point forecast so it resolves in
+        # price units (the ticker alone never carries a series_id)
+        sid = conn.execute("SELECT id FROM series LIMIT 1").fetchone()["id"]
+        conn.execute("UPDATE predictions SET point_forecast = 6.53,"
+                     " forecast_sd = 0.03, series_id = ? WHERE id = ?",
+                     (sid, pid))
+        conn.commit()
+        posfile = _write_json(os.path.join(self.tmp, "pos.json"),
+                              {"market_ticker": "KXTEST-26SEP22-T6.530",
+                               "side": "yes", "contracts": 10,
+                               "fill_price": 0.2, "prediction_id": pid})
+        rs.record_position(conn, type("A", (), {"file": posfile, "json": True})())
+        res = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        row = conn.execute("SELECT outcome FROM predictions").fetchone()
+        self.assertIn(row["outcome"], ("up", "down", "flat"))
+        self.assertEqual(res["positions_settled"], [])
+        pos = conn.execute("SELECT settled_at FROM positions").fetchone()
+        self.assertIsNone(pos["settled_at"])
+        conn.close()
+
+    def test_unlinked_positions_stay_open(self):
+        """Positions with no linked prediction and no ticker match stay open."""
+        conn, pid = self._setup("KXTEST-26SEP22-T6.530")
+        posfile = _write_json(os.path.join(self.tmp, "pos.json"),
+                              {"market_ticker": "KXOTHER-26SEP30-X",
+                               "side": "yes", "contracts": 10,
+                               "fill_price": 0.3})
+        rs.record_position(conn, type("A", (), {"file": posfile, "json": True})())
+        rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        pos = conn.execute(
+            "SELECT settled_at FROM positions WHERE market_ticker ="
+            " 'KXOTHER-26SEP30-X'").fetchone()
+        self.assertIsNone(pos["settled_at"])
+        conn.close()
+
+
+class TestPnlReport(StoreTestCase):
+    def _two_settled(self):
+        """One winner (yes @0.19 on a YES outcome) and one loser."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        args = type("A", (), {"family": "KXTEST", "backfill": 2,
+                              "offset_hours": 3.0, "since": None,
+                              "json": True})()
+        rs.ingest_quotes(conn, args)   # stores real quote bars for T6.525/530
+        conn.commit()
+        for ticker, side, fill in (("KXTEST-26SEP22-T6.525", "yes", 0.19),
+                                   ("KXTEST-26SEP22-T6.530", "yes", 0.60)):
+            pfile = _write_json(os.path.join(self.tmp, "p_%s.json" % side),
+                                {"market_ticker": ticker, "p_yes": 0.2,
+                                 "target_date": "2026-09-22"})
+            pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+            posfile = _write_json(os.path.join(self.tmp, "pos.json"),
+                                  {"market_ticker": ticker, "side": side,
+                                   "contracts": 10, "fill_price": fill,
+                                   "prediction_id": pred["written"][0]["id"]})
+            rs.record_position(conn, type("A", (), {"file": posfile,
+                                                    "json": True})())
+        rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        conn.commit()
+        return conn
+
+    def test_pnl_totals(self):
+        conn = self._two_settled()
+        out = rs.cmd_pnl(conn, type("A", (), {"open": False, "json": True})())
+        self.assertEqual(out["realized_count"], 2)
+        self.assertEqual(out["open_count"], 0)
+        expect = (10 * 0.81 - rs.taker_fee(10, 0.19)) + (-(10 * 0.60) - rs.taker_fee(10, 0.60))
+        self.assertAlmostEqual(out["total_realized_pnl"], expect, places=6)
+        self.assertAlmostEqual(out["total_realized_pnl"],
+                               8.1 - 0.11 + -6.0 - 0.17, places=6)
+        conn.close()
+
+    def test_pnl_open_marks_from_stored_quotes(self):
+        conn = self._two_settled()
+        # one position stays open (no matching prediction); T6.510 exists in
+        # the synthetic ladder and settles NO, but nothing predicts it
+        posfile = _write_json(os.path.join(self.tmp, "pos_open.json"),
+                              {"market_ticker": "KXTEST-26SEP22-T6.510",
+                               "side": "yes", "contracts": 4,
+                               "fill_price": 0.30})
+        rs.record_position(conn, type("A", (), {"file": posfile,
+                                                "json": True})())
+        conn.commit()
+        out = rs.cmd_pnl(conn, type("A", (), {"open": True, "json": True})())
+        self.assertEqual(out["realized_count"], 2)
+        self.assertEqual(out["open_count"], 1)
+        op = out["open_positions"][0]
+        self.assertIn("mark", op)
+        self.assertIsNotNone(op["mark"])
+        self.assertIn("mark_to_market", op)
+        self.assertEqual(op["mark_to_market"],
+                         "UNREALIZED mark from stored quotes - not realized")
+        self.assertAlmostEqual(op["mark"], 4 * (0.40 - 0.30), places=6)
+        conn.close()
+
+    def test_pnl_mark_prefers_bid_then_ask_then_last(self):
+        conn = self.init()
+        conn.execute(
+            "INSERT INTO quotes(market_ticker, end_period_ts,"
+            " hours_before_close, close_dollars, yes_bid_dollars,"
+            " yes_ask_dollars, volume_fp, open_interest_fp, asof, fetched_at)"
+            " VALUES ('KXM-1', 1, 2.0, 0.50, 0.44, 0.46, 1, 1, ?, ?)",
+            (rs.now_iso(), rs.now_iso()))
+        conn.execute(
+            "INSERT INTO quotes(market_ticker, end_period_ts,"
+            " hours_before_close, close_dollars, yes_bid_dollars,"
+            " yes_ask_dollars, volume_fp, open_interest_fp, asof, fetched_at)"
+            " VALUES ('KXM-1', 2, 1.0, 0.60, NULL, NULL, 1, 1, ?, ?)",
+            (rs.now_iso(), rs.now_iso()))
+        conn.commit()
+        posfile = _write_json(os.path.join(self.tmp, "pos.json"),
+                              {"market_ticker": "KXM-1", "side": "yes",
+                               "contracts": 10, "fill_price": 0.40})
+        rs.record_position(conn, type("A", (), {"file": posfile,
+                                                "json": True})())
+        conn.commit()
+        out = rs.cmd_pnl(conn, type("A", (), {"open": True, "json": True})())
+        # most recent row (hours_before_close 1.0) has bid only
+        self.assertAlmostEqual(out["open_positions"][0]["mark"],
+                               10 * (0.60 - 0.40), places=6)
+        conn.close()
+
+    def test_pnl_on_an_empty_store_degrades_gracefully(self):
+        conn = self.init()
+        out = rs.cmd_pnl(conn, type("A", (), {"open": True, "json": True})())
+        self.assertEqual(out["realized_count"], 0)
+        self.assertEqual(out["open_count"], 0)
+        self.assertEqual(out["total_realized_pnl"], 0.0)
+        self.assertEqual(out["open_positions"], [])
         conn.close()
 
 
