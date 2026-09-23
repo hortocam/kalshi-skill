@@ -1047,6 +1047,18 @@ def series_observations(conn, series_id, as_of=None):
     return [by_date[d] for d in sorted(by_date)]
 
 
+def _obs_at(obs, date):
+    """Index of the observation dated exactly `date`, or None if there is none.
+
+    A print's date is not interchangeable with a neighbouring date's print: a
+    forecast for one date scored against another date's number measures nothing.
+    """
+    for i, o in enumerate(obs):
+        if o["date"] == date:
+            return i
+    return None
+
+
 def _src_rank(source):
     try:
         return SOURCE_PRIORITY.index(source)
@@ -1850,12 +1862,14 @@ def resolve_predictions(conn, args):
     """Score ripe predictions.
 
     `error` is scored in the units of `forecast_sd` (design §1c).  When a
-    prediction carries a point forecast AND its series has a stored print for
-    the target date, the error is in the series' own units (price) and the
-    outcome is the print's direction.  Otherwise a market-ticker prediction is
-    scored in probability units against the settled result, and `units` says
-    which happened — a probability error must never be z-scored against a price
-    sd, so the units are reported explicitly.
+    prediction carries a point forecast AND its series has a stored print dated
+    exactly `target_date`, the error is in the series' own units (price) and the
+    outcome is the print's direction.  A print for a *different* date is not a
+    substitute: with no print on the target date the prediction is left
+    unresolved and counted in `still_unresolvable`.  Otherwise a market-ticker
+    prediction is scored in probability units against the settled result, and
+    `units` says which happened — a probability error must never be z-scored
+    against a price sd, so the units are reported explicitly.
     """
     as_of = args.as_of or day_of(now_iso())
     rows = conn.execute(
@@ -1868,15 +1882,17 @@ def resolve_predictions(conn, args):
         error = None
         units = None
         # Prefer the point-forecast path: that is the one forecast_sd describes.
+        # It scores ONLY against a print dated exactly `target_date`.  When the
+        # series has no print for that date the prediction stays unresolved:
+        # scoring a 9/30 forecast against an 8/31 print produces a plausible
+        # error that measures nothing, and a stale-but-wrong number is worse
+        # than an honest "not yet resolvable".
         if p["series_id"] is not None and p["point_forecast"] is not None:
             obs = series_observations(conn, p["series_id"])
-            cur = None
-            prev = None
-            for o in obs:
-                if o["date"] <= p["target_date"]:
-                    prev = cur
-                    cur = o
-            if cur is not None:
+            i = _obs_at(obs, p["target_date"])
+            if i is not None:
+                cur = obs[i]
+                prev = obs[i - 1] if i > 0 else None
                 error = p["point_forecast"] - cur["value"]
                 units = "price"
                 if prev is None:
