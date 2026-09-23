@@ -19,7 +19,10 @@ Every endpoint in this skill is public: no API key, no account, no request signi
 Trading and portfolio endpoints exist but are deliberately out of scope here — they
 require RSA-signed authentication.
 
-See `references/api-endpoints.md` for the full endpoint reference with curl examples.
+See `references/api-endpoints.md` for the full endpoint reference with curl examples,
+and `references/research-continuity.md` for the research continuity store
+(`scripts/research_store.py`) that lets a bot profile accumulate market research
+across runs instead of re-deriving it.
 
 ## When to Use
 
