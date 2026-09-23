@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Spec Kit transient cache (regenerated on demand)
+.specify/integrations/.cache/
