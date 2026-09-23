@@ -28,6 +28,8 @@ Usage:
     python3 research_store.py record-prediction --file pred.json
     python3 research_store.py resolve-predictions [--as-of DATE]
     python3 research_store.py series --family KXDIESELD [--tail 20]
+    python3 research_store.py record-position --file pos.json
+    python3 research_store.py pnl [--open]
 
 Every subcommand accepts `--json` (one JSON object on stdout) and takes no
 interactive input.  Environment: `KALSHI_RESEARCH_DB` overrides the DB path,
@@ -56,7 +58,34 @@ from datetime import datetime, timedelta, timezone
 # Constants
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# v1 -> v2 (card t_4302ce7e, "Addendum: positions & P&L"): the `positions`
+# table and `predictions.position_id`.  The v1 DDL above is CREATE IF NOT
+# EXISTS, so re-running `init` on an existing store preserves every row; the
+# two ALTER TABLE statements below are the only non-idempotent statements and
+# are guarded by _V2_HAS (see init_db).
+SCHEMA_SQL_V2 = """
+CREATE TABLE IF NOT EXISTS positions(         -- an executed trade (schema v2)
+  id INTEGER PRIMARY KEY,
+  prediction_id INTEGER REFERENCES predictions(id),
+  market_ticker TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('yes','no')),
+  contracts REAL NOT NULL CHECK (contracts > 0),
+  fill_price REAL NOT NULL CHECK (fill_price > 0 AND fill_price < 1),
+  fee REAL NOT NULL CHECK (fee >= 0),
+  opened_at TEXT NOT NULL,                    -- ISO UTC
+  settled_at TEXT,                            -- resolution timestamp
+  realized_pnl REAL,
+  created_at TEXT NOT NULL,
+  UNIQUE(market_ticker, side, opened_at));
+
+CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_ticker);
+CREATE INDEX IF NOT EXISTS idx_positions_pred ON positions(prediction_id);
+"""
+
+_V2_ALTERS = (("predictions", "position_id",
+               "ALTER TABLE predictions ADD COLUMN position_id INTEGER"),)
 
 BASE = os.environ.get(
     "KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2"
@@ -204,9 +233,14 @@ CREATE INDEX IF NOT EXISTS idx_predictions_target ON predictions(target_date);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
 """
 
+# v2 objects are appended to the base schema so `executescript(SCHEMA_SQL)`
+# in init_db keeps creating the full current schema in one go; init_db then
+# applies the guarded ALTERs and stamps the version row.
+SCHEMA_SQL += SCHEMA_SQL_V2
+
 TABLE_NAMES = ("schema_version", "series", "observations", "settlements",
                "markets", "quotes", "models", "predictions", "cache_meta",
-               "runs")
+               "runs", "positions")
 
 
 # --------------------------------------------------------------------------
@@ -464,13 +498,50 @@ def open_store(args):
 
 
 def init_db(conn):
+    """Create or migrate the store in place.
+
+    v1 stores keep every row: the DDL is CREATE IF NOT EXISTS and the ALTER
+    TABLE statements are guarded by a pragma check, so re-running `init` on
+    any schema is a no-op (the idempotency/migration contract, FR-013).
+    """
     conn.executescript(SCHEMA_SQL)
+    for table, column, stmt in _V2_ALTERS:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        if column not in cols:
+            conn.execute(stmt)
     row = conn.execute("SELECT MAX(version) v FROM schema_version").fetchone()
-    if not row or row["v"] is None:
+    top = row["v"] if row and row["v"] is not None else 0
+    if top == 0:
+        conn.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+            (SCHEMA_VERSION, now_iso()))
+    elif top < SCHEMA_VERSION:
+        # Keep the v1 row for the audit trail; append the new version.
         conn.execute(
             "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, now_iso()))
     conn.commit()
+
+
+# Kalshi's published taker fee schedule (fetched 2026-09-23): the fee is
+# round-UP-to-the-cent of M * 0.07 * C * P * (1-P), where P is the fill price
+# in dollars, C the contract count, M the series' fee_multiplier.  There is no
+# settlement fee; contracts settle at $1.00 (yes) / $0.00 (no).
+TAKER_FEE_RATE = 0.07
+CENT = 0.01
+_EPS = 1e-9
+
+
+def taker_fee(contracts, fill_price, multiplier=1):
+    """Taker fee in dollars, rounded UP to the next cent.
+
+    An exact multiple of a cent must not gain a spurious cent (hence the
+    epsilon before the ceiling).
+    """
+    raw = multiplier * TAKER_FEE_RATE * contracts * fill_price * (
+        1.0 - fill_price)
+    cents = raw / CENT
+    return math.ceil(cents - _EPS) * CENT
 
 
 def table_counts(conn):
@@ -1858,6 +1929,169 @@ def record_prediction(conn, args):
             "written": written, "count": len(written)}
 
 
+# --------------------------------------------------------------------------
+# positions (schema v2) — the executed trade, and its realized P&L
+# --------------------------------------------------------------------------
+
+def record_position(conn, args):
+    """Record an executed trade (`--file`, one JSON object or a list).
+
+    Required: market_ticker, side ('yes'|'no'), contracts (>0), fill_price
+    (0 < p < 1).  Optional: fee (default: computed taker fee, rounded UP to
+    the cent — the formula is authoritative, the caller's number is accepted
+    only when given), prediction_id, opened_at (default now).
+
+    fill_price is ALWAYS the price paid for the side bought: the YES price for
+    side='yes', the NO price for side='no' (roughly 1 - the YES price).  The
+    orderbook quotes YES prices; a NO fill at NO-price 0.81 is the same trade
+    as a YES fill at 0.19, and recording which side was bought matters for
+    resolution (see _position_pnl).
+    """
+    with open(os.path.expanduser(args.file)) as fh:
+        data = json.load(fh)
+    items = data if isinstance(data, list) else [data]
+    families = []
+    for it in items:
+        fam = it.get("family")
+        if fam:
+            families.append(fam)
+        elif it.get("market_ticker"):
+            # Kalshi event tickers prefix the series ticker; the series ticker
+            # is the family key the store already knows (FR-011: opaque).
+            fam = it["market_ticker"].split("-", 1)[0]
+            if conn.execute("SELECT 1 AS one FROM series WHERE family = ?",
+                            (fam,)).fetchone():
+                families.append(fam)
+    run_id = begin_run(conn, families=families or None)
+
+    written, duplicates = [], 0
+    for it in items:
+        ticker = it.get("market_ticker")
+        side = it.get("side")
+        contracts = dnum(it.get("contracts"))
+        fill = dnum(it.get("fill_price"))
+        if not ticker:
+            raise SystemExit("position requires market_ticker")
+        if side not in ("yes", "no"):
+            raise SystemExit("position side must be 'yes' or 'no'")
+        if contracts is None or contracts <= 0:
+            raise SystemExit("position requires contracts > 0")
+        if fill is None or not (0.0 < fill < 1.0):
+            raise SystemExit("position fill_price must be in (0, 1)")
+        fee = it.get("fee")
+        if fee is None:
+            fee = taker_fee(contracts, fill)
+        else:
+            fee = dnum(fee)
+            if fee is None or fee < 0:
+                raise SystemExit("position fee must be >= 0")
+        opened_at = it.get("opened_at") or now_iso()
+        prediction_id = it.get("prediction_id")
+        if prediction_id is not None:
+            pred = conn.execute("SELECT id FROM predictions WHERE id = ?",
+                                (prediction_id,)).fetchone()
+            if pred is None:
+                raise SystemExit("unknown prediction_id %s" % prediction_id)
+        # Idempotency key: (market_ticker, side, opened_at).  Detect a
+        # duplicate BEFORE the write — lastrowid does not reliably report the
+        # conflict-update path of an UPSERT.
+        existing = conn.execute(
+            "SELECT id, settled_at FROM positions WHERE market_ticker = ? AND"
+            " side = ? AND opened_at = ?", (ticker, side, opened_at)).fetchone()
+        if existing is None:
+            cur = conn.execute(
+                "INSERT INTO positions(prediction_id, market_ticker, side,"
+                " contracts, fill_price, fee, opened_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (prediction_id, ticker, side, contracts, fill, fee, opened_at,
+                 now_iso()))
+            pos_id = cur.lastrowid
+            inserted = True
+        else:
+            pos_id = existing["id"]
+            inserted = False
+            if existing["settled_at"] is None:
+                # A re-submission corrects an OPEN position's fill fields but
+                # must never touch a settled one (P&L stays frozen).
+                conn.execute(
+                    "UPDATE positions SET contracts = ?, fill_price = ?,"
+                    " fee = ?, prediction_id = COALESCE(?, prediction_id)"
+                    " WHERE id = ?",
+                    (contracts, fill, fee, prediction_id, pos_id))
+        if prediction_id is not None and pos_id is not None:
+            conn.execute(
+                "UPDATE predictions SET position_id = ? WHERE id = ? AND"
+                " position_id IS NULL", (pos_id, prediction_id))
+        if inserted:
+            written.append({"id": pos_id, "market_ticker": ticker,
+                            "side": side, "contracts": contracts,
+                            "fill_price": fill, "fee": fee,
+                            "opened_at": opened_at,
+                            "prediction_id": prediction_id})
+        else:
+            duplicates += 1
+    touch_run(conn, run_id)
+    conn.commit()
+    return {"command": "record-position", "run_id": run_id,
+            "written": written, "duplicates": duplicates,
+            "count": len(written)}
+
+
+def _position_pnl(position, outcome):
+    """Realized P&L for one settled position.
+
+    `fill_price` is the price PAID for the bought side, so winning pays
+    contracts * (1 - fill_price) - fee and losing costs the full premium plus
+    fee: contracts * fill_price + fee (settling at $0).  Symmetric for
+    side='no' with the NO price.
+    """
+    contracts = position["contracts"]
+    fill = position["fill_price"]
+    fee = position["fee"] or 0.0
+    win = (position["side"] == "yes" and outcome == "yes") or \
+          (position["side"] == "no" and outcome == "no")
+    if win:
+        return contracts * (1.0 - fill) - fee
+    return -(contracts * fill) - fee
+
+
+def _settle_positions_for(conn, pred_id, ticker, outcome, settled_at,
+                          want_side=None):
+    """Settle open positions linked to a prediction (position_id or
+    market_ticker+side).  Idempotent: settled_at/realized_pnl, once written,
+    are never rewritten."""
+    settled = []
+    rows = conn.execute(
+        "SELECT * FROM positions WHERE realized_pnl IS NULL AND settled_at IS"
+        " NULL AND (prediction_id = ? OR (market_ticker = ? AND (? IS NULL OR"
+        " side = ?)))", (pred_id, ticker, want_side, want_side)).fetchall()
+    for pos in rows:
+        pnl = _position_pnl(pos, outcome)
+        conn.execute(
+            "UPDATE positions SET settled_at = ?, realized_pnl = ? WHERE id ="
+            " ?", (settled_at, pnl, pos["id"]))
+        settled.append({"id": pos["id"], "market_ticker": pos["market_ticker"],
+                        "side": pos["side"], "contracts": pos["contracts"],
+                        "fill_price": pos["fill_price"], "fee": pos["fee"],
+                        "realized_pnl": pnl, "settled_at": settled_at})
+    return settled
+
+
+def _expected_sides(pred):
+    """Which position sides could this prediction have been a trade in?
+
+    `direction` is the forecast direction (up => long YES, down => long NO);
+    an absent direction means the trader's side is unknown, so both sides are
+    candidates and the market_ticker side-match alone must not settle a
+    possibly-unrelated position.
+    """
+    if pred["direction"] == "up":
+        return ("yes",)
+    if pred["direction"] == "down":
+        return ("no",)
+    return ("yes", "no")
+
+
 def resolve_predictions(conn, args):
     """Score ripe predictions.
 
@@ -1918,14 +2152,124 @@ def resolve_predictions(conn, args):
         conn.execute(
             "UPDATE predictions SET resolved_at = ?, outcome = ?, error = ?"
             " WHERE id = ?", (now, outcome, error, p["id"]))
+        positions_settled = []
+        if outcome in ("yes", "no"):
+            # A settled prediction is also a settled trade: settle every open
+            # position linked to it (explicitly by position_id, or by
+            # market_ticker + the side the direction implies).  'up'/'down'
+            # outcomes are print directions, NOT market settlements, and never
+            # settle anything.
+            sides = _expected_sides(p)
+            for side in sides:
+                positions_settled.extend(_settle_positions_for(
+                    conn, p["id"], p["market_ticker"], outcome, now,
+                    want_side=side))
         resolved.append({"id": p["id"], "target_date": p["target_date"],
                          "outcome": outcome, "error": error, "units": units,
                          "p_yes": p["p_yes"],
-                         "point_forecast": p["point_forecast"]})
+                         "point_forecast": p["point_forecast"],
+                         "positions_settled": positions_settled})
     conn.commit()
     return {"command": "resolve-predictions", "as_of": as_of,
             "resolved": resolved, "resolved_count": len(resolved),
+            "positions_settled": [s for r in resolved
+                                  for s in r["positions_settled"]],
             "still_unresolvable": skipped}
+
+
+# --------------------------------------------------------------------------
+# pnl — realized report and the open-position mark (stored quotes only)
+# --------------------------------------------------------------------------
+
+def _latest_quote(conn, market_ticker):
+    """The most recent stored quote for a market: smallest hours_before_close
+    (closest to now/close), bid preferred, then ask, then last."""
+    row = conn.execute(
+        "SELECT close_dollars, yes_bid_dollars, yes_ask_dollars FROM quotes"
+        " WHERE market_ticker = ? ORDER BY hours_before_close ASC LIMIT 1",
+        (market_ticker,)).fetchone()
+    if row is None:
+        return None
+    for v in (row["yes_bid_dollars"], row["yes_ask_dollars"],
+              row["close_dollars"]):
+        if v is not None:
+            return v
+    return None
+
+
+def cmd_pnl(conn, args):
+    """Realized P&L for settled positions; with --open, a mark-to-market VIEW
+    of open positions built ONLY from quotes already in the store (FR-010: no
+    network).  The mark is an unrealized estimate, never a realized result."""
+    realized = conn.execute(
+        "SELECT * FROM positions WHERE settled_at IS NOT NULL"
+        " ORDER BY settled_at").fetchall()
+    open_rows = conn.execute(
+        "SELECT * FROM positions WHERE settled_at IS NULL"
+        " ORDER BY opened_at").fetchall()
+    rows = []
+    total = 0.0
+    for pos in realized:
+        pnl = pos["realized_pnl"]
+        total += pnl or 0.0
+        rows.append({"id": pos["id"],
+                     "prediction_id": pos["prediction_id"],
+                     "market_ticker": pos["market_ticker"], "side": pos["side"],
+                     "contracts": pos["contracts"],
+                     "fill_price": pos["fill_price"], "fee": pos["fee"],
+                     "opened_at": pos["opened_at"],
+                     "settled_at": pos["settled_at"],
+                     "realized_pnl": pnl})
+    open_positions = []
+    for pos in open_rows:
+        entry = {"id": pos["id"], "prediction_id": pos["prediction_id"],
+                 "market_ticker": pos["market_ticker"], "side": pos["side"],
+                 "contracts": pos["contracts"], "fill_price": pos["fill_price"],
+                 "fee": pos["fee"], "opened_at": pos["opened_at"]}
+        quote = _latest_quote(conn, pos["market_ticker"])
+        if quote is not None:
+            mark_price = quote if pos["side"] == "yes" else 1.0 - quote
+            entry["mark_quote"] = quote
+            entry["mark"] = pos["contracts"] * (mark_price - pos["fill_price"])
+        else:
+            entry["mark"] = None
+            entry["mark_note"] = "no stored quote for this market"
+        entry["mark_to_market"] = ("UNREALIZED mark from stored quotes -"
+                                   " not realized")
+        open_positions.append(entry)
+    payload = {
+        "command": "pnl", "open": bool(args.open),
+        "realized": rows, "realized_count": len(rows),
+        "total_realized_pnl": total,
+        "open_positions": open_positions if args.open else [],
+        "open_count": len(open_positions) if args.open else len(open_rows),
+    }
+
+    def text(p):
+        print("realized P&L: %d settled position(s), total %+.2f"
+              % (p["realized_count"], p["total_realized_pnl"]))
+        for r in p["realized"]:
+            print("  %-28s %-3s n=%-6g @ %.2f  fee %.2f  pnl %+.2f"
+                  "  settled %s" % (r["market_ticker"], r["side"],
+                                    r["contracts"], r["fill_price"], r["fee"],
+                                    r["realized_pnl"], r["settled_at"]))
+        if p["open_positions"]:
+            print("open positions (mark-to-market from stored quotes —"
+                  " UNREALIZED, not realized):")
+            for o in p["open_positions"]:
+                mark = ("mark %+.2f (quote %s)" % (o["mark"],
+                                                   fmt(o.get("mark_quote"), 2))
+                        if o.get("mark") is not None else o.get(
+                            "mark_note", "no stored quote"))
+                print("  %-28s %-3s n=%-6g @ %.2f  %s"
+                      % (o["market_ticker"], o["side"], o["contracts"],
+                         o["fill_price"], mark))
+        if p["open_count"] and not args.open:
+            print("open positions: %d (run with --open to mark them from"
+                  " stored quotes)" % p["open_count"])
+
+    emit(payload, args.json, text)
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -2063,9 +2407,32 @@ def build_parser():
     add_common(sp)
     sp.add_argument("--file", required=True)
 
-    sp = sub.add_parser("resolve-predictions", help="score ripe predictions")
+    sp = sub.add_parser(
+        "record-position",
+        help="record an executed trade (contracts, fill price, fee)")
+    add_common(sp)
+    sp.add_argument("--file", required=True,
+                    help="JSON file, one object or a list.  Required keys:"
+                         " market_ticker, side ('yes'|'no'), contracts,"
+                         " fill_price.  Optional: fee (default: the Kalshi"
+                         " taker formula, rounded UP to the cent),"
+                         " prediction_id, opened_at (ISO UTC, default now)."
+                         "  fill_price is ALWAYS the price paid for the side"
+                         " bought — the NO price (about 1 - yes_price) when"
+                         " side='no'.")
+
+    sp = sub.add_parser("resolve-predictions",
+                        help="score ripe predictions; settles linked positions")
     add_common(sp)
     sp.add_argument("--as-of", default=None)
+
+    sp = sub.add_parser("pnl", help="realized P&L (+ --open mark, no network)")
+    add_common(sp)
+    sp.add_argument("--open", action="store_true",
+                    help="also mark open positions to market using the most"
+                         " recent STORED quote per market (bid, then ask, then"
+                         " last).  This is an unrealized mark, not a realized"
+                         " result; no network access is performed.")
 
     sp = sub.add_parser("series", help="tail a family's observation series")
     add_common(sp)
@@ -2124,8 +2491,13 @@ def main(argv=None):
             return 0
         elif args.command == "record-prediction":
             payload = record_prediction(conn, args)
+        elif args.command == "record-position":
+            payload = record_position(conn, args)
         elif args.command == "resolve-predictions":
             payload = resolve_predictions(conn, args)
+        elif args.command == "pnl":
+            payload = cmd_pnl(conn, args)
+            return 0
         elif args.command == "series":
             cmd_series(conn, args)
             return 0

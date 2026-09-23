@@ -178,3 +178,42 @@ prior fit remains readable.
 - Kalshi public API (`https://api.elections.kalshi.com/trade-api/v2`) for settled ladders and quotes.
 - Yahoo Finance for daily closes (`meta.regularMarketTime` is the `asof` source, not the bar
   timestamp).
+
+## Addendum: positions & P&L (2026-09-23)
+
+Card `t_4302ce7e`. The store records the *expectation* (FR-008) but had nowhere
+to record the *trade* or its *result*. Schema v2 adds an executed-trade ledger
+and its realized P&L. New functional requirements (existing FRs unchanged):
+
+- **FR-013**: The system MUST store positions in a dedicated `positions` table
+  (schema v2: `positions`, plus a nullable `predictions.position_id` FK), with
+  the idempotency key `UNIQUE(market_ticker, side, opened_at)` and CHECK
+  constraints `side IN ('yes','no')`, `contracts > 0`, `0 < fill_price < 1`,
+  `fee >= 0`. The v1→v2 migration MUST be idempotent and preserve every
+  existing row, keeping prior `schema_version` rows for the audit trail.
+- **FR-014**: The system MUST record an executed trade (`record-position --file`)
+  with required `market_ticker`, `side`, `contracts`, `fill_price` and optional
+  `fee`, `prediction_id`, `opened_at`. When `fee` is omitted the system MUST
+  compute it — round UP to the next cent of `M * 0.07 * C * P * (1-P)` (Kalshi
+  taker schedule; no settlement fee) — and MUST NOT accept an omitted fee on
+  faith. `fill_price` is ALWAYS the price paid for the side bought: the YES
+  price for `side='yes'`, the NO price (≈ `1 - yes_price`) for `side='no'`.
+  The command MUST begin/touch a run like `record-prediction` does.
+- **FR-015**: When a prediction resolves to a market outcome (`yes`/`no`), the
+  system MUST settle every open position linked to it — explicitly by
+  `position_id`, or by `market_ticker` plus the side implied by the
+  prediction's `direction` (`up` → yes, `down` → no; absent direction → no
+  side match) — computing
+  `realized_pnl = contracts * (1 - fill_price) - fee` on a win and
+  `-(contracts * fill_price) - fee` on a loss, stamping `settled_at` with the
+  resolution timestamp. Print-direction outcomes (`up`/`down`/`flat`) MUST NOT
+  settle positions. Settlement MUST be idempotent: re-running MUST NOT change
+  `settled_at` or `realized_pnl`. Positions with no resolvable prediction MUST
+  stay open.
+- **FR-016**: The system MUST report realized P&L (`pnl`) over settled
+  positions with totals, and with `--open` a mark-to-market VIEW of open
+  positions built ONLY from the most recent stored `quotes` row per market
+  (bid preferred, then ask, then last; a NO position marks at `1 - quote`),
+  clearly labelled as an unrealized mark, not a realized result. The report
+  MUST require no network access (FR-010); live mark-to-market in resolution
+  is out of scope.
