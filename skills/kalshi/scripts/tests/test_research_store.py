@@ -80,13 +80,19 @@ def fake_settled(series_ticker, min_close_ts, max_close_ts):
 def fake_open(series_ticker):
     if series_ticker != "KXTEST":
         return []
-    close = "2026-09-23T05:59:00Z"
+    # An "open" ladder must close in the future: find_stale() selects open
+    # ladders with `close_ts > now`, so an absolute close_time silently stops
+    # being an open ladder the moment it passes.  Derive it from now.
+    close_dt = datetime.now(timezone.utc) + timedelta(days=1)
+    close = close_dt.strftime("%Y-%m-%dT05:59:00Z")
+    day = close_dt.strftime("%d")
+    month = close_dt.strftime("%b").upper()
     out = []
     for k in range(-4, 5):
         strike = round(6.53 + k * 0.005, 6)
         out.append({
-            "ticker": "KXTEST-26SEP23-T%.3f" % strike,
-            "event_ticker": "KXTEST-26SEP23",
+            "ticker": "KXTEST-26%s%s-T%.3f" % (month, day, strike),
+            "event_ticker": "KXTEST-26%s%s" % (month, day),
             "floor_strike": strike, "strike_type": "greater", "result": "",
             "status": "active", "close_time": close, "volume_fp": "5.00",
             "rules_primary": "r%d" % k,
@@ -476,6 +482,59 @@ class TestPredictions(StoreTestCase):
         # above the print), so the probability error is p_yes - 0.0.
         self.assertEqual(res["resolved"][0]["outcome"], "no")
         self.assertAlmostEqual(res["resolved"][0]["error"], 0.2, places=6)
+        conn.close()
+
+    def test_regression_does_not_resolve_without_a_target_date_print(self):
+        """A target date with no print must NOT resolve against an older print.
+
+        Only 2026-09-20/21/22 have prints.  A prediction targeting 09-23 used
+        to walk back a day and score against the 09-22 print; it must instead
+        resolve nothing and stay unresolved in the DB.
+        """
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = os.path.join(self.tmp, "p_absent.json")
+        with open(pfile, "w") as fh:
+            json.dump({"family": "KXTEST", "target_date": "2026-09-23",
+                       "p_yes": 0.4, "point_forecast": 6.5480,
+                       "forecast_sd": 0.03}, fh)
+        rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        res = rs.resolve_predictions(conn,
+                                     type("A", (), {"as_of": "2026-10-01"})())
+        self.assertEqual(res["resolved_count"], 0)
+        self.assertEqual(res["resolved"], [])
+        self.assertEqual(res["still_unresolvable"], 1)
+        row = conn.execute("SELECT resolved_at, outcome, error FROM predictions"
+                           ).fetchone()
+        self.assertIsNone(row["resolved_at"], "no print on the target date =>"
+                                              " the prediction must stay pending")
+        self.assertIsNone(row["outcome"])
+        self.assertIsNone(row["error"])
+        conn.close()
+
+    def test_boundary_scoring_resolves_against_the_target_date_print(self):
+        """Resolving as-of a much later date still uses the target-date print."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = os.path.join(self.tmp, "p_boundary.json")
+        with open(pfile, "w") as fh:
+            json.dump({"family": "KXTEST", "target_date": "2026-09-21",
+                       "p_yes": 0.4, "point_forecast": 6.5300,
+                       "forecast_sd": 0.03}, fh)
+        rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        # 09-22 (6.5275) and 09-20 (6.5075) also have prints; the 09-21 print
+        # (6.5125) is the only correct basis.
+        res = rs.resolve_predictions(conn,
+                                     type("A", (), {"as_of": "2026-11-30"})())
+        self.assertEqual(res["resolved_count"], 1)
+        got = res["resolved"][0]
+        self.assertEqual(got["target_date"], "2026-09-21")
+        self.assertEqual(got["units"], "price")
+        self.assertAlmostEqual(got["error"], 6.5300 - 6.5125, places=6)
+        # 09-21 (6.5125) is above 09-20 (6.5075), so the print's direction is up.
+        self.assertEqual(got["outcome"], "up")
         conn.close()
 
 
