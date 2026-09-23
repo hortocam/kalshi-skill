@@ -810,6 +810,53 @@ class TestPositionResolution(StoreTestCase):
         self.assertIsNone(back["position_id"])
         conn.close()
 
+    def test_absent_direction_settles_explicit_links_only(self):
+        """An absent `direction` implies no side (FR-015): the market_ticker
+        match alone must not settle an unlinked position, while an explicitly
+        linked position settles regardless of side."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = _write_json(os.path.join(self.tmp, "p.json"),
+                            {"market_ticker": "KXTEST-26SEP22-T6.530",
+                             "p_yes": 0.2, "target_date": "2026-09-22"})
+        pred = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        pid = pred["written"][0]["id"]
+        # same ticker, no link: must stay open
+        unlinked = _write_json(os.path.join(self.tmp, "pos_un.json"),
+                               {"market_ticker": "KXTEST-26SEP22-T6.530",
+                                "side": "yes", "contracts": 10,
+                                "fill_price": 0.2})
+        rs.record_position(conn, type("A", (), {"file": unlinked,
+                                                "json": True})())
+        # linked by prediction_id: settles regardless of side
+        linked = _write_json(os.path.join(self.tmp, "pos_l.json"),
+                             {"market_ticker": "KXTEST-26SEP22-T6.530",
+                              "side": "no", "contracts": 5,
+                              "fill_price": 0.81, "prediction_id": pid})
+        rs.record_position(conn, type("A", (), {"file": linked,
+                                                "json": True})())
+        res = rs.resolve_predictions(conn, type("A", (), {"as_of": None})())
+        self.assertEqual(res["resolved_count"], 1)
+        self.assertEqual(len(res["positions_settled"]), 1)
+        rows = conn.execute("SELECT prediction_id, settled_at, realized_pnl"
+                            " FROM positions ORDER BY id").fetchall()
+        self.assertIsNone(rows[0]["prediction_id"])
+        self.assertIsNone(rows[0]["settled_at"])
+        self.assertIsNone(rows[0]["realized_pnl"])
+        self.assertEqual(rows[1]["prediction_id"], pid)
+        self.assertIsNotNone(rows[1]["settled_at"])
+        # T6.530 settles NO, so a NO position wins at the NO price
+        self.assertAlmostEqual(rows[1]["realized_pnl"],
+                               5 * (1 - 0.81) - rs.taker_fee(5, 0.81),
+                               places=6)
+        conn.close()
+
+    def test_expected_sides_never_invent_a_side(self):
+        self.assertEqual(rs._expected_sides({"direction": None}), ())
+        self.assertEqual(rs._expected_sides({"direction": "up"}), ("yes",))
+        self.assertEqual(rs._expected_sides({"direction": "down"}), ("no",))
+
     def test_price_unit_outcomes_never_settle_positions(self):
         """'up'/'down' outcomes are print directions, not settlements."""
         conn, pid = self._setup("KXTEST-26SEP22-T6.530")

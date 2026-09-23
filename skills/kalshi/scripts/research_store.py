@@ -2057,14 +2057,22 @@ def _position_pnl(position, outcome):
 
 def _settle_positions_for(conn, pred_id, ticker, outcome, settled_at,
                           want_side=None):
-    """Settle open positions linked to a prediction (position_id or
-    market_ticker+side).  Idempotent: settled_at/realized_pnl, once written,
-    are never rewritten."""
+    """Settle open positions linked to a prediction.
+
+    A position settles when it is explicitly linked (prediction_id = pred_id)
+    or, when `want_side` is given, when its market_ticker matches `ticker` and
+    its side matches `want_side`.  With `want_side` unset only explicit links
+    settle — a market_ticker match alone must never settle a possibly-unrelated
+    position.  Idempotent: settled_at/realized_pnl, once written, are never
+    rewritten.
+    """
     settled = []
     rows = conn.execute(
         "SELECT * FROM positions WHERE realized_pnl IS NULL AND settled_at IS"
-        " NULL AND (prediction_id = ? OR (market_ticker = ? AND (? IS NULL OR"
-        " side = ?)))", (pred_id, ticker, want_side, want_side)).fetchall()
+        " NULL AND (prediction_id = :pred_id OR (:want_side IS NOT NULL AND"
+        " market_ticker = :ticker AND side = :want_side))",
+        {"pred_id": pred_id, "want_side": want_side,
+         "ticker": ticker}).fetchall()
     for pos in rows:
         pnl = _position_pnl(pos, outcome)
         conn.execute(
@@ -2081,15 +2089,15 @@ def _expected_sides(pred):
     """Which position sides could this prediction have been a trade in?
 
     `direction` is the forecast direction (up => long YES, down => long NO);
-    an absent direction means the trader's side is unknown, so both sides are
-    candidates and the market_ticker side-match alone must not settle a
-    possibly-unrelated position.
+    an absent direction implies no side at all (FR-015), so only explicit
+    `position_id` links settle and the market_ticker match alone must never
+    settle a possibly-unrelated position.
     """
     if pred["direction"] == "up":
         return ("yes",)
     if pred["direction"] == "down":
         return ("no",)
-    return ("yes", "no")
+    return ()
 
 
 def resolve_predictions(conn, args):
@@ -2155,15 +2163,19 @@ def resolve_predictions(conn, args):
         positions_settled = []
         if outcome in ("yes", "no"):
             # A settled prediction is also a settled trade: settle every open
-            # position linked to it (explicitly by position_id, or by
-            # market_ticker + the side the direction implies).  'up'/'down'
-            # outcomes are print directions, NOT market settlements, and never
-            # settle anything.
+            # position linked to it — explicitly by position_id always, and by
+            # market_ticker + the side the direction implies when the
+            # prediction carries one (absent direction => explicit links only).
+            # 'up'/'down' outcomes are print directions, NOT market
+            # settlements, and never settle anything.
             sides = _expected_sides(p)
             for side in sides:
                 positions_settled.extend(_settle_positions_for(
                     conn, p["id"], p["market_ticker"], outcome, now,
                     want_side=side))
+            if not sides:
+                positions_settled.extend(_settle_positions_for(
+                    conn, p["id"], p["market_ticker"], outcome, now))
         resolved.append({"id": p["id"], "target_date": p["target_date"],
                          "outcome": outcome, "error": error, "units": units,
                          "p_yes": p["p_yes"],
