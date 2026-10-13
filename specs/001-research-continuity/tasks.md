@@ -64,3 +64,15 @@ Card `t_4302ce7e`. Implements FR-013…FR-016. All rows written TDD (red first).
 - [x] T033 Settlement in `resolve-predictions`: explicit `position_id` links always settle; ticker side-match only when `direction` implies a side (absent direction → explicit links only, FR-015); idempotent re-resolve (evidence: `test_absent_direction_settles_explicit_links_only`, `test_expected_sides_never_invent_a_side`, `test_reresolve_is_idempotent`)
 - [x] T034 `pnl [--open]`: realized rows + totals, and a stored-quotes-only mark for open positions, no network per FR-016 (evidence: `test_pnl_totals`, `test_pnl_open_marks_from_stored_quotes`, `test_pnl_on_an_empty_store_degrades_gracefully`)
 - [x] T035 Positions test suite green: 50 stdlib unittest tests, `python3 skills/kalshi/scripts/tests/test_research_store.py` → `Ran 50 tests in 3.250s — OK`
+
+## Phase 8: Per-market settlement clocks (schema v3, addendum 2026-10-12)
+
+Card `t_f0c52e93`. Implements FR-017…FR-018. TDD (red probe reproduced the v3 gaps before implementation).
+
+- [x] T036 Additive migration v2→v3: `expected_expiration_time` + `latest_expiration_time` as nullable TEXT columns on `markets`, SCHEMA_VERSION 3, guarded ALTERs (idempotent re-init, no-op), audit trail extended — per FR-017 (evidence: `TestMarketClocks.test_v2_store_migrates_to_v3_preserving_rows`, `test_schema_v3_markets_columns_exist`)
+- [x] T037 Persist both clocks at market upsert (`_write_market`, settled and open paths) and carry them in the ingest payload's `open_events` — per FR-017 (evidence: `test_ingest_stores_close_time_and_expected_expiration`, `test_open_events_payload_carries_both_clocks`)
+- [x] T038 `record-prediction` output enriches each written entry with `close_time` + `expected_expiration_time` (NULL for an unknown market); `pnl --open` output and its text rendering carry the same fields with named-clock lines — per FR-018 (evidence: `test_record_prediction_output_includes_clocks`, `test_pnl_open_output_includes_clocks`, `test_et_stamp_renders_eastern_time`)
+- [x] T039 Live-store migration rehearsal on a copy of `~/.hermes/profiles/kalshi-bot/research/kalshi.sqlite`: every data table bit-identical (4845 markets, 307 predictions, 9 positions), trail `[1,2]` → `[1,2,3]`, re-init a no-op — per acceptance criterion 4 (evidence: `tests/verify_v3_livecopy.py` → "every data table preserved PASS", "market rows bit-identical PASS", "re-init on the migrated copy is a no-op PASS", "ALL CHECKS PASSED")
+- [x] T040 Verification smoke tests still true under v3: fresh init has the new columns, `pnl` degrades gracefully on the migrated store (realized 9 positions, total −$15.34, 0 open) — per acceptance criterion 4 (evidence: verify script "pnl degrades gracefully on the live copy PASS", "fresh store has both clock columns PASS")
+- [x] T041 Full suite green: 58 stdlib unittest tests, `python3 skills/kalshi/scripts/tests/test_research_store.py` → `Ran 58 tests in 2.692s — OK`
+- [x] T042 Docs updated: `references/research-continuity.md` (v3 addendum in the header, "The three clocks" section with consumer rules, `pnl --open` clock fields) and `spec.md` (FR-017/FR-018 addendum) — per Constitution VII

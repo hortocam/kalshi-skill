@@ -217,3 +217,31 @@ and its realized P&L. New functional requirements (existing FRs unchanged):
   clearly labelled as an unrealized mark, not a realized result. The report
   MUST require no network access (FR-010); live mark-to-market in resolution
   is out of scope.
+
+## Addendum: per-market settlement clocks (2026-10-12)
+
+Card `t_f0c52e93`. A market carries three distinct clocks — the trading close,
+the expected settlement print, and the latest settlement boundary — and the
+store recorded only the first. Consumers that needed a settlement time guessed
+it from `close_time`, which produced "settles 01:59 ET" for a market that
+actually settles the next morning on the AAA print (`can_close_early` makes
+01:59/23:59 deadlines, not guarantees). Schema v3 records all three. New
+functional requirements (existing FRs unchanged):
+
+- **FR-017**: The system MUST persist `expected_expiration_time` and
+  `latest_expiration_time` (ISO-8601 UTC strings, published verbatim by the
+  exchange) as new nullable columns on the `markets` table at market upsert
+  time (`ingest-settled`, settled and open paths alike). The v2→v3 migration
+  MUST be additive and idempotent, preserve every existing row across all
+  tables, and extend the `schema_version` audit trail (v1→v2 rows survive; the
+  trail for a store created at v1 records `[1, 3]`). Existing rows keep NULL
+  clocks: the system MUST NOT fabricate a settlement time from a heuristic —
+  a missing clock is degraded to an absent field, never guessed.
+- **FR-018**: Report surfaces MUST distinguish the clocks they name.
+  `record-prediction` output MUST include `close_time` and
+  `expected_expiration_time` per written entry when the market is stored (NULL
+  otherwise); `pnl --open` output MUST include the same two fields per open
+  position; the digest MUST NOT label a `close_time` as "settles" — open
+  markets are reported as `trade-close <ts>` plus, when stored,
+  `settles exp <ts>`. Human rendering quotes ET via zoneinfo (EDT/EST follows
+  the date) with an explicit UTC fallback when the tz database is absent.

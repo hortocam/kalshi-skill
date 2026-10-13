@@ -6,14 +6,17 @@ so this suite is deterministic and runs anywhere.  Run it with:
 
     python3 tests/test_research_store.py
 
-It covers what the card's acceptance criteria assert:
+It covers what the cards' acceptance criteria assert:
   1. the 12-table schema and the NOT NULL freshness contract,
   2. band reconstruction parity against the recorded truth,
   3. digest line budget and the five sections,
   4. staleness detection,
   5. fit drift (fit_date / n_obs / inputs_rev) and before->after deltas,
   6. run-boundary semantics that make `--since-last-run` a real window,
-  7. CLI surface: every subcommand named in the design exists and has --json.
+  7. CLI surface: every subcommand named in the design exists and has --json,
+  8. per-market clocks (schema v3, card t_f0c52e93): the additive v2->v3
+     migration, both settlement columns at upsert time, the enriched
+     record-prediction / pnl --open outputs, and digest clock labelling.
 """
 
 import importlib.util
@@ -47,6 +50,10 @@ def _mk_event(day, truth, step=0.005, n_above=4, n_below=4):
     ev = "KXTEST-%s%02d" % (month, day) if False else "KXTEST-26%s%02d" % (
         month, day)
     close = "2026-09-%02dT05:59:00Z" % day
+    # The exchange publishes three clocks per market; the settlement print is
+    # the morning AFTER the trading close for can_close_early families.
+    expected_expiry = "2026-09-%02dT11:00:00Z" % day
+    latest_expiry = "2026-09-%02dT12:00:00Z" % day
     markets = []
     mid = round(round(truth / step) * step, 6)
     for k in range(-n_below, n_above + 1):
@@ -60,6 +67,8 @@ def _mk_event(day, truth, step=0.005, n_above=4, n_below=4):
             "result": result,
             "status": "finalized",
             "close_time": close,
+            "expected_expiration_time": expected_expiry,
+            "latest_expiration_time": latest_expiry,
             "settlement_ts": close,
             "expiration_value": "%.4f" % truth,
             "rules_primary": "If X on day %d is above $%.3f then Yes." % (day,
@@ -94,7 +103,12 @@ def fake_open(series_ticker):
             "ticker": "KXTEST-26%s%s-T%.3f" % (month, day, strike),
             "event_ticker": "KXTEST-26%s%s" % (month, day),
             "floor_strike": strike, "strike_type": "greater", "result": "",
-            "status": "active", "close_time": close, "volume_fp": "5.00",
+            "status": "active", "close_time": close,
+            "expected_expiration_time":
+                close_dt.strftime("%Y-%m-%dT11:00:00Z"),
+            "latest_expiration_time":
+                close_dt.strftime("%Y-%m-%dT12:00:00Z"),
+            "volume_fp": "5.00",
             "rules_primary": "r%d" % k,
         })
     return out
@@ -600,7 +614,10 @@ class TestPositionSchema(StoreTestCase):
         self.assertIn("position_id", cols)
         vers = [r["version"] for r in conn.execute(
             "SELECT version FROM schema_version ORDER BY version")]
-        self.assertEqual(vers, [1, 2], "the v1 version row must survive")
+        # v1 was recorded when the store was created; v3 is the current
+        # version stamped by this migration.  (A v1-era store never carried
+        # a v2 row: v2 shipped later, so the trail is [1, 3] under v3 code.)
+        self.assertEqual(vers, [1, rs.SCHEMA_VERSION])
         row = conn.execute(
             "SELECT market_ticker, p_yes FROM predictions LIMIT 1").fetchone()
         self.assertIsNotNone(row["market_ticker"])
@@ -990,6 +1007,191 @@ class TestPnlReport(StoreTestCase):
         self.assertEqual(out["open_count"], 0)
         self.assertEqual(out["total_realized_pnl"], 0.0)
         self.assertEqual(out["open_positions"], [])
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Per-market clocks: close_time + expected_expiration_time (schema v3,
+# card t_f0c52e93).  The trading close and the settlement print are
+# different clocks; collapsing them produced "settles 01:59 ET" for a
+# market that actually settles on the next morning's AAA print.
+# --------------------------------------------------------------------------
+
+class TestMarketClocks(StoreTestCase):
+    def test_schema_v3_markets_columns_exist(self):
+        """A fresh init creates both settlement clocks; the trading close
+        keeps its v2 column set."""
+        conn = self.init()
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(markets)")}
+        self.assertIn("close_time", cols)
+        self.assertIn("expected_expiration_time", cols)
+        self.assertIn("latest_expiration_time", cols)
+        conn.close()
+
+    def test_v2_store_migrates_to_v3_preserving_rows(self):
+        """A v2 store (both v3 columns dropped, version rows cut back, as the
+        real pre-migration store has) must migrate additively on the next
+        `init`: every prior row intact, both columns added, the [1,2] audit
+        trail extended with 3."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        before = rs.table_counts(conn)
+        rows = conn.execute("SELECT * FROM markets").fetchall()
+        conn.close()
+        # Regress to the exact v2 shape, then re-run init (the same path a
+        # real v2 deployment takes when this code ships).
+        conn = rs.connect(self.db)
+        conn.executescript(
+            "ALTER TABLE markets DROP COLUMN expected_expiration_time;"
+            "ALTER TABLE markets DROP COLUMN latest_expiration_time;")
+        # A real v2 store carries its full audit trail: it was created at v1
+        # and stamped v2 on migration, so the version rows are [1, 2].
+        conn.executescript(
+            "DELETE FROM schema_version;"
+            "INSERT INTO schema_version(version, applied_at) VALUES"
+            " (1, '2026-09-23T00:51:22.482125Z'),"
+            " (2, '2026-09-23T23:22:46.986533Z');")
+        conn.commit()
+        conn.close()
+        conn = rs.connect(self.db)
+        rs.init_db(conn)
+        after = rs.table_counts(conn)
+        # Data tables must be identical; schema_version grows by design
+        # (the audit trail records the migration).
+        self.assertEqual({k: v for k, v in after.items() if k != "schema_version"},
+                         {k: v for k, v in before.items()
+                          if k != "schema_version"})
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(markets)")}
+        self.assertIn("expected_expiration_time", cols)
+        self.assertIn("latest_expiration_time", cols)
+        vers = [r["version"] for r in conn.execute(
+            "SELECT version FROM schema_version ORDER BY version")]
+        self.assertEqual(vers, [1, 2, 3])
+        # Every row's payload survived the ALTER TABLEs.
+        now_rows = conn.execute("SELECT * FROM markets").fetchall()
+        self.assertEqual(len(now_rows), len(rows))
+        kept = {r["market_ticker"]: r["close_time"] for r in now_rows}
+        for old in rows:
+            self.assertEqual(kept[old["market_ticker"]], old["close_time"])
+        conn.close()
+
+    def test_ingest_stores_close_time_and_expected_expiration(self):
+        """ingest-settled persists both clocks per market, verbatim UTC."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        row = conn.execute(
+            "SELECT close_time, expected_expiration_time,"
+            " latest_expiration_time FROM markets WHERE market_ticker ="
+            " 'KXTEST-26SEP22-T6.525'").fetchone()
+        self.assertEqual(row["close_time"], "2026-09-22T05:59:00Z")
+        self.assertEqual(row["expected_expiration_time"],
+                         "2026-09-22T11:00:00Z")
+        self.assertEqual(row["latest_expiration_time"],
+                         "2026-09-22T12:00:00Z")
+        conn.close()
+
+    def test_open_events_payload_carries_both_clocks(self):
+        """The ingest payload's open_events must carry both clocks so
+        report consumers never have to guess settlement from close_time."""
+        conn = self.init()
+        out = rs.ingest_settled(conn, self.settled_args(no_open=False))
+        conn.commit()
+        self.assertTrue(out["open_events"])
+        ev = out["open_events"][0]
+        self.assertIn("close_time", ev)
+        self.assertIn("expected_expiration_time", ev)
+        self.assertTrue(ev["close_time"])
+        self.assertTrue(ev["expected_expiration_time"])
+        conn.close()
+
+    def test_et_stamp_renders_eastern_time(self):
+        """05:59Z on a September day is 01:59 AM ET (EDT); December is
+        EST.  The zone handling must follow the date, not a hardcoded
+        offset."""
+        self.assertEqual(rs._et_stamp("2026-09-24T05:59:00Z"),
+                         "2026-09-24 01:59 ET")
+        self.assertEqual(rs._et_stamp("2026-12-24T05:59:00Z"),
+                         "2026-12-24 00:59 ET")
+        self.assertIsNone(rs._et_stamp(None))
+        self.assertIsNone(rs._et_stamp("not-a-date"))
+        self.assertIsNone(rs._et_stamp(""))
+
+    def test_record_prediction_output_includes_clocks(self):
+        """record-prediction output carries both stored clocks when the
+        market is known, and omits-nothing/None when it is not."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        pfile = _write_json(os.path.join(self.tmp, "p_clock.json"),
+                            {"market_ticker": "KXTEST-26SEP22-T6.525",
+                             "p_yes": 0.4, "target_date": "2026-09-22"})
+        out = rs.record_prediction(conn, type("A", (), {"file": pfile})())
+        w = out["written"][0]
+        self.assertEqual(w["close_time"], "2026-09-22T05:59:00Z")
+        self.assertEqual(w["expected_expiration_time"],
+                         "2026-09-22T11:00:00Z")
+        # Unknown market: the keys are present with None, never invented.
+        pfile2 = _write_json(os.path.join(self.tmp, "p_unknown.json"),
+                             {"market_ticker": "KXWHO-26SEP30-T7.000",
+                              "p_yes": 0.3, "target_date": "2026-09-30"})
+        out2 = rs.record_prediction(conn, type("A", (), {"file": pfile2})())
+        w2 = out2["written"][0]
+        self.assertIsNone(w2["close_time"])
+        self.assertIsNone(w2["expected_expiration_time"])
+        conn.close()
+
+    def test_pnl_open_output_includes_clocks(self):
+        """pnl --open output per open market carries close_time and
+        expected_expiration_time; degraded to None when unknown."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args())
+        conn.commit()
+        posfile = _write_json(os.path.join(self.tmp, "pos_clock.json"),
+                              {"market_ticker": "KXTEST-26SEP22-T6.525",
+                               "side": "yes", "contracts": 2,
+                               "fill_price": 0.19})
+        rs.record_position(conn, type("A", (), {"file": posfile,
+                                                "json": True})())
+        conn.commit()
+        out = rs.cmd_pnl(conn, type("A", (), {"open": True, "json": True})())
+        op = out["open_positions"][0]
+        self.assertEqual(op["close_time"], "2026-09-22T05:59:00Z")
+        self.assertEqual(op["expected_expiration_time"],
+                         "2026-09-22T11:00:00Z")
+        # Position in a market the store never saw: degrade, do not invent.
+        posfile2 = _write_json(os.path.join(self.tmp, "pos_unknown.json"),
+                               {"market_ticker": "KXWHO-26SEP30-T7.000",
+                                "side": "yes", "contracts": 1,
+                                "fill_price": 0.4})
+        rs.record_position(conn, type("A", (), {"file": posfile2,
+                                                "json": True})())
+        conn.commit()
+        out2 = rs.cmd_pnl(conn, type("A", (), {"open": True, "json": True})())
+        unknown = [o for o in out2["open_positions"]
+                   if o["market_ticker"] == "KXWHO-26SEP30-T7.000"][0]
+        self.assertIsNone(unknown["close_time"])
+        self.assertIsNone(unknown["expected_expiration_time"])
+        conn.close()
+
+    def test_digest_lines_label_both_clocks(self):
+        """The digest must not say a market 'settles' at its trading close:
+        the close is labelled as a close and the settlement print named
+        separately when stored."""
+        conn = self.init()
+        rs.ingest_settled(conn, self.settled_args(no_open=False))
+        conn.commit()
+        payload = rs.build_digest(conn, max_lines=60, since_last_run=True)
+        text = payload["digest"]
+        # The old bug's exact signature: "settles <ISO timestamp>" naming a
+        # trading close.  "settles exp <ISO>" (the settlement clock) is fine.
+        self.assertNotRegex(text, r"\bsettles \d{4}-\d{2}-\d{2}")
+        section4 = payload["sections"][3]["lines"]
+        self.assertTrue(section4, "open-market delta should list events")
+        joined = " ".join(section4)
+        self.assertIn("trade-close", joined)
+        self.assertIn("settles exp ", joined)
         conn.close()
 
 

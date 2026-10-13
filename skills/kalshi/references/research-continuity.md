@@ -6,7 +6,8 @@ SQLite store it owns.
 
 Design authority: card `t_367040dd` (`research-continuity-design.md`), approved
 by independent review. Implementation: card `t_eb12306c`. Addendum — positions
-& realized P&L (schema v2): card `t_4302ce7e`.
+& realized P&L (schema v2): card `t_4302ce7e`. Addendum — per-market settlement
+clocks (schema v3): card `t_f0c52e93`.
 
 ## The split
 
@@ -40,7 +41,10 @@ assumption, and it is load-bearing: converting a 03:59Z close into
 ## Schema — eleven tables
 
 `schema_version`, `series`, `observations`, `settlements`, `markets`, `quotes`,
-`models`, `predictions`, `cache_meta`, `runs`, `positions` (v2).
+`models`, `predictions`, `cache_meta`, `runs`, `positions` (v2). v3 adds two
+additive nullable columns on `markets` (see "The three clocks" below); the
+v1→v2→v3 migrations are idempotent and preserve every row, keeping prior
+`schema_version` rows for the audit trail.
 
 | Table | Holds | Natural key (idempotent writes) |
 |---|---|---|
@@ -98,6 +102,33 @@ window* grid (lag 0 = the most recent exogenous change at or before the date,
 lag k = k entries earlier in the exogenous series' own calendar). Every
 regressor is knowable at `t-1`; feeding the current change into the AR column
 would make the regressor equal the dependent and return `R² = 1`, `resid_sd = 0`.
+
+## The three clocks (schema v3)
+
+Every market carries three distinct timestamps, and collapsing them is how a
+card once said "settles 01:59 ET" for a market that actually settled the next
+morning on the AAA print (01:59 ET is the trading close — `can_close_early`
+means 01:59/23:59 are deadlines, not guarantees; the settlement print lands the
+morning after):
+
+| Column | Clock | Meaning |
+|---|---|---|
+| `close_time` / `close_ts` | trading close | when trading stops and the last trade prints |
+| `expected_expiration_time` | settlement (expected) | when the exchange expects to publish the settlement value |
+| `latest_expiration_time` | settlement (latest) | the rulebook's latest settlement boundary |
+
+Rules for consumers:
+
+- **Label the clock you mean.** `pnl --open` prints "trading closes <ET>" and
+  "settles on the print (expected <ET>)"; the digest says `trade-close <ts>`
+  and, when stored, `settles exp <ts>`. A bare "settles <ts>" naming a
+  `close_time` is a bug this column set exists to prevent.
+- **Quote ET for US event markets.** The store keeps ISO-8601 UTC; rendering
+  helpers convert with zoneinfo (ET/EDT/EST follows the date, never a hardcoded
+  offset) and fall back to an explicit UTC label if the tz database is absent.
+- **Never fabricate.** Rows written before v3 carry NULL clocks; reports degrade
+  to omitting the line. A missing clock is reported as missing, never guessed
+  from the other clocks.
 
 ## Freshness contract
 
@@ -223,6 +254,12 @@ then ask, then last; a NO position is marked at `1 - quote`) — clearly labelle
 an unrealized mark, never a realized result, and computed with **no network
 access** (FR-010): the `--open` view from stored quotes is the cap; live
 mark-to-market in resolution is deliberately out of scope.
+
+Every open position in `pnl --open` also carries its market's clocks (v3):
+`close_time` and `expected_expiration_time` (NULL when the market has not been
+ingested — degraded, not guessed). `record-prediction`'s per-item output carries
+the same two fields for the named market, so a prediction can be reported as
+"trading closes X, settles on the print expected Y" in one read.
 
 ## Commands
 

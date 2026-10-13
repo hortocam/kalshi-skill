@@ -11,6 +11,12 @@ unauthenticated.  No signing, no account, no orders.  The store lives under the
 profile root (`~/.hermes/profiles/kalshi-bot/research/kalshi.sqlite`), never in
 the 24h-pruned scratch dir.
 
+Schema v3 (card t_f0c52e93) records the three clocks per market: the trading
+close (`close_time`, the last-trade deadline — often "01:59 ET"-style, NOT the
+settlement moment) plus `expected_expiration_time` / `latest_expiration_time`
+(the expected / latest settlement print).  Consumers must label which clock
+they mean and never collapse close_time into "settles at".
+
 Usage:
     python3 research_store.py init [--db PATH]
     python3 research_store.py ingest-settled --family KXDIESELD [--since 2026-09-01]
@@ -58,7 +64,19 @@ from datetime import datetime, timedelta, timezone
 # Constants
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# v2 -> v3 (card t_f0c52e93, "Record the three clocks per market"): additive
+# nullable columns on `markets`.  A market carries THREE clocks and the store
+# must not collapse them: `close_time`/`close_ts` is the trading close (the
+# last trade — often a "01:59 ET"-style deadline, not a settlement moment),
+# `expected_expiration_time` is when the exchange expects the settlement print,
+# and `latest_expiration_time` is the rulebook's latest settlement boundary.
+# None of them is "the market settles at" on its own.
+_V3_MARKET_COLUMNS = ("expected_expiration_time", "latest_expiration_time")
+_V3_ALTERS = tuple(
+    ("markets", col, "ALTER TABLE markets ADD COLUMN %s TEXT" % col)
+    for col in _V3_MARKET_COLUMNS)
 
 # v1 -> v2 (card t_4302ce7e, "Addendum: positions & P&L"): the `positions`
 # table and `predictions.position_id`.  The v1 DDL above is CREATE IF NOT
@@ -175,7 +193,9 @@ CREATE TABLE IF NOT EXISTS markets(           -- strikes: ladder + arithmetic
   event_ticker TEXT NOT NULL,
   floor_strike REAL, strike_type TEXT,
   result TEXT,
-  close_ts INTEGER NOT NULL, close_time TEXT,
+  close_ts INTEGER NOT NULL, close_time TEXT, -- trading close (last trade)
+  expected_expiration_time TEXT,              -- expected settlement print (v3)
+  latest_expiration_time TEXT,                -- latest settlement boundary (v3)
   rules_hash TEXT,
   asof TEXT NOT NULL, fetched_at TEXT NOT NULL);
 
@@ -285,6 +305,28 @@ def day_of(text):
     if ts is None:
         return None
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _et_stamp(text):
+    """Render an ISO timestamp as '2026-09-23 22:00 ET', or None.
+
+    Kalshi's US event markets settle on Eastern-Time prints, so consumers
+    should quote ET rather than make the reader convert UTC by hand.  Falls
+    back to None for a None/absent/invalid value so callers can skip the
+    field cleanly.  ET vs EDT vs EST is resolved by zoneinfo from the
+    timestamp itself, never hardcoded.
+    """
+    ts = parse_ts(text)
+    if ts is None:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        # No tz database: report UTC explicitly rather than mislabel it.
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ts, tz=et).strftime("%Y-%m-%d %H:%M ET")
 
 
 def fmt(v, nd=4):
@@ -509,6 +551,10 @@ def init_db(conn):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
         if column not in cols:
             conn.execute(stmt)
+    for table, column, stmt in _V3_ALTERS:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        if column not in cols:
+            conn.execute(stmt)
     row = conn.execute("SELECT MAX(version) v FROM schema_version").fetchone()
     top = row["v"] if row and row["v"] is not None else 0
     if top == 0:
@@ -516,7 +562,7 @@ def init_db(conn):
             "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, now_iso()))
     elif top < SCHEMA_VERSION:
-        # Keep the v1 row for the audit trail; append the new version.
+        # Keep the prior version rows for the audit trail; append the new one.
         conn.execute(
             "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, now_iso()))
@@ -708,23 +754,54 @@ def _rules_hash(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _market_clocks(conn, market_ticker):
+    """The stored clocks for one market: trading close + expected settlement.
+
+    Read from the `markets` table (populated by ingest); both keys are None
+    when the market is unknown — the report must degrade, not fabricate.
+    `close_time` is the last-trade deadline; `expected_expiration_time` the
+    expected settlement print.  They are different clocks (can_close_early
+    families settle the morning AFTER the close) and neither substitutes for
+    the other.
+    """
+    row = conn.execute(
+        "SELECT close_time, expected_expiration_time FROM markets"
+        " WHERE market_ticker = ?", (market_ticker,)).fetchone()
+    if row is None:
+        return {"close_time": None, "expected_expiration_time": None}
+    return {"close_time": row["close_time"],
+            "expected_expiration_time": row["expected_expiration_time"]}
+
+
 def _write_market(conn, m, series_row, now, unit=None):
-    """Upsert one market row.  asof = the source's own claim."""
+    """Upsert one market row.  asof = the source's own claim.
+
+    The three clocks are stored verbatim as the exchange published them:
+    `close_time` (trading close) plus `expected_expiration_time` /
+    `latest_expiration_time` (settlement).  They are NOT interchangeable —
+    `can_close_early` families settle on a print the next morning, so collapsing
+    close_time into "settles at" was the bug this column set exists for.
+    """
     close_ts = parse_ts(m.get("close_time")) or 0
     asof = m.get("settlement_ts") or m.get("close_time") or now
     conn.execute(
         "INSERT INTO markets(market_ticker, event_ticker, floor_strike,"
-        " strike_type, result, close_ts, close_time, rules_hash, asof,"
-        " fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " strike_type, result, close_ts, close_time,"
+        " expected_expiration_time, latest_expiration_time, rules_hash, asof,"
+        " fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(market_ticker) DO UPDATE SET"
         " event_ticker=excluded.event_ticker, floor_strike=excluded.floor_strike,"
         " strike_type=excluded.strike_type, result=excluded.result,"
         " close_ts=excluded.close_ts, close_time=excluded.close_time,"
+        " expected_expiration_time=excluded.expected_expiration_time,"
+        " latest_expiration_time=excluded.latest_expiration_time,"
         " rules_hash=excluded.rules_hash, asof=excluded.asof,"
         " fetched_at=excluded.fetched_at",
         (m.get("ticker"), m.get("event_ticker"), dnum(m.get("floor_strike")),
          m.get("strike_type"), m.get("result") or None, close_ts,
-         m.get("close_time"), _rules_hash(m.get("rules_primary")), asof, now))
+         m.get("close_time"), m.get("expected_expiration_time"),
+         m.get("latest_expiration_time"),
+         _rules_hash(m.get("rules_primary")), asof, now))
 
 
 def _ladder_band(markets):
@@ -857,6 +934,8 @@ def ingest_settled(conn, args):
             open_events.append({
                 "event": event_ticker,
                 "close_time": sub[0].get("close_time"),
+                "expected_expiration_time": sub[0].get(
+                    "expected_expiration_time"),
                 "n_strikes": len(sub),
                 "n_quoted": sum(
                     1 for m in sub if (dnum(m.get("volume_fp")) or 0) > 0),
@@ -1731,6 +1810,7 @@ def digest_sections(conn, family=None, since=None, has_prior_run=False):
     lines = []
     events = conn.execute(
         "SELECT m.event_ticker, MIN(m.close_time) close_time,"
+        " MIN(m.expected_expiration_time) expected_expiration_time,"
         " MIN(m.close_ts) close_ts, COUNT(*) n,"
         " (SELECT COUNT(*) FROM quotes q JOIN markets m2"
         "   ON m2.market_ticker = q.market_ticker"
@@ -1738,9 +1818,14 @@ def digest_sections(conn, family=None, since=None, has_prior_run=False):
         " FROM markets m WHERE m.close_ts > ? GROUP BY m.event_ticker"
         " ORDER BY m.close_ts LIMIT 4", (now_ts,)).fetchall()
     for ev in events:
-        lines.append("%-24s close %s   %d strikes, %d quoted"
-                     % (ev["event_ticker"], ev["close_time"], ev["n"],
-                        ev["quoted"]))
+        clock = "trade-close %s" % ev["close_time"]
+        if ev["expected_expiration_time"]:
+            # The settlement print is a DIFFERENT clock from the trading
+            # close; naming them separately is the whole point of the v3
+            # columns (can_close_early families settle the next morning).
+            clock += "; settles exp %s" % ev["expected_expiration_time"]
+        lines.append("%-24s %s   %d strikes, %d quoted"
+                     % (ev["event_ticker"], clock, ev["n"], ev["quoted"]))
         movers = []
         for m in conn.execute(
                 "SELECT market_ticker, floor_strike FROM markets"
@@ -1773,11 +1858,18 @@ def digest_sections(conn, family=None, since=None, has_prior_run=False):
             p["market_ticker"] or p["event_ticker"] or "?", p["target_date"] or "",
             fmt(p["p_yes"], 2)))
     for ev in conn.execute(
-            "SELECT event_ticker, MIN(close_ts) close_ts, COUNT(*) n FROM markets"
+            "SELECT event_ticker, MIN(close_ts) close_ts,"
+            " MIN(expected_expiration_time) expected_expiration_time"
+            " FROM markets"
             " WHERE close_ts > ? GROUP BY event_ticker ORDER BY close_ts LIMIT 4",
             (now_ts,)):
-        lines.append("%s settles %s (%s)" % (
-            ev["event_ticker"], iso(ev["close_ts"]), fmt(
+        # "settles" here would repeat the 01:59-ET mistake: close_ts is the
+        # trading close, expected_expiration_time the settlement print.
+        due = "trade-closes"
+        if ev["expected_expiration_time"]:
+            due += ", settles exp %s" % ev["expected_expiration_time"]
+        lines.append("%s %s %s (%s)" % (
+            ev["event_ticker"], due, iso(ev["close_ts"]), fmt(
                 (ev["close_ts"] - now_ts) / 3600.0, 1) + "h"))
     if not lines:
         lines.append("nothing unsettled and nothing pending")
@@ -1919,10 +2011,16 @@ def record_prediction(conn, args):
              it.get("target_date"), it["p_yes"], it.get("market_price"), edge,
              it.get("direction"), it.get("point_forecast"),
              it.get("forecast_sd"), it.get("rationale")))
-        written.append({"id": cur.lastrowid,
-                        "market_ticker": it.get("market_ticker"),
-                        "target_date": it.get("target_date"),
-                        "p_yes": it["p_yes"], "edge_points": edge})
+        entry = {"id": cur.lastrowid,
+                 "market_ticker": it.get("market_ticker"),
+                 "target_date": it.get("target_date"),
+                 "p_yes": it["p_yes"], "edge_points": edge}
+        # The market's clocks ride along when the market is in the store, so
+        # the consumer can say "trading closes X / settles exp Y" without a
+        # second lookup — and without inventing either clock when absent.
+        if it.get("market_ticker"):
+            entry.update(_market_clocks(conn, it["market_ticker"]))
+        written.append(entry)
     touch_run(conn, run_id)
     conn.commit()
     return {"command": "record-prediction", "run_id": run_id,
@@ -2219,6 +2317,8 @@ def cmd_pnl(conn, args):
     open_rows = conn.execute(
         "SELECT * FROM positions WHERE settled_at IS NULL"
         " ORDER BY opened_at").fetchall()
+    open_clocks = {pos["market_ticker"]: _market_clocks(conn, pos["market_ticker"])
+                   for pos in open_rows}
     rows = []
     total = 0.0
     for pos in realized:
@@ -2238,6 +2338,10 @@ def cmd_pnl(conn, args):
                  "market_ticker": pos["market_ticker"], "side": pos["side"],
                  "contracts": pos["contracts"], "fill_price": pos["fill_price"],
                  "fee": pos["fee"], "opened_at": pos["opened_at"]}
+        clocks = open_clocks[pos["market_ticker"]]
+        # Both clocks ride along when stored (may be None if the market row
+        # has not been ingested yet); the report never invents a time.
+        entry.update(clocks)
         quote = _latest_quote(conn, pos["market_ticker"])
         if quote is not None:
             mark_price = quote if pos["side"] == "yes" else 1.0 - quote
@@ -2276,6 +2380,14 @@ def cmd_pnl(conn, args):
                 print("  %-28s %-3s n=%-6g @ %.2f  %s"
                       % (o["market_ticker"], o["side"], o["contracts"],
                          o["fill_price"], mark))
+                # Named clocks, ET: "trading closes" is the last-trade
+                # deadline, "settles" the expected print — different clocks.
+                close_et = _et_stamp(o.get("close_time"))
+                if close_et:
+                    print("      trading closes %s" % close_et)
+                exp_et = _et_stamp(o.get("expected_expiration_time"))
+                if exp_et:
+                    print("      settles on the print (expected %s)" % exp_et)
         if p["open_count"] and not args.open:
             print("open positions: %d (run with --open to mark them from"
                   " stored quotes)" % p["open_count"])
